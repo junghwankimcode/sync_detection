@@ -1,0 +1,337 @@
+clear all;
+close all;
+clc;
+%rng(1234); 
+
+trainSNRVec = [-20:5:5];
+TrainSet = 1e4;
+TestSet = 1e4;
+
+N = 37;
+numbers=primes(N-1);
+Rset =  numbers(gcd(numbers,N)==1);
+
+hiddenSize = 24;
+
+% TDL-B 채널 모델 데이터 (Table 7.7.2-2)
+tap_delays = [0.0000, 0.1072, 0.2155, 0.2095, 0.2870, 0.2986, 0.3752, 0.5055, 0.3681, 0.3697, ...
+              0.5700, 0.5283, 1.1021, 1.2756, 1.5474, 1.7842, 2.0169, 2.8294, 3.0219, 3.6187, ...
+              4.1067, 4.2790, 4.7834] * 1e-6; 
+
+tap_powers_dB = [0, -2.2, -4, -3.2, -9.8, -1.2, -3.4, -5.2, -7.6, -3, ...
+                 -8.9, -9, -4.8, -5.7, -7.5, -1.9, -7.6, -12.2, -9.8, -11.4, ...
+                 -14.9, -9.2, -11.3];
+tap_powers = 10.^(tap_powers_dB / 10); 
+cp_len = 16; 
+Fs = 100e6; 
+carrier_freq = 3.5e9; 
+L = 3;
+
+for indexN = 1:length(trainSNRVec)
+
+    trainSNR = trainSNRVec(indexN)
+
+trainAns = [];
+testAns  = [];
+
+trainData2 = [];
+testData2  = [];
+
+trainData3 = [];
+testData3 = [];
+
+trainData4 = [];
+testData4  = [];
+
+trainData_RF=[];
+testData_RF=[];
+
+testData_AT=[];
+
+parfor k=1:TrainSet
+    
+    R= 0; % initialization 
+    R = Rset(randi(length(Rset),1));
+
+    whoRU = randi(2,1);
+    
+     
+        
+        xx_freq = zadoffChuSeq(R, N);
+        xx = ifft(xx_freq);
+        
+      
+        xx_cp = [xx(end-cp_len+1:end); xx];
+
+        % 다중경로 채널 모델 적용 (TDL-B)
+        h_time = zeros(N, 1);
+        for l = 1:L
+            delay_samples = round(tap_delays(l) * Fs);
+            if delay_samples < N
+                h_time(delay_samples+1) = (randn + 1j*randn) * sqrt(tap_powers(l)/2);
+            end
+        end
+
+        h_freq = fft(h_time, N);
+        rx_signal_freq = xx_freq .* h_freq;
+        rx_signal_time = ifft(rx_signal_freq);
+
+       
+        t = (0:length(rx_signal_time)-1).' / Fs;
+        tx_upconverted = rx_signal_time .* exp(1j * 2 * pi * carrier_freq * t);
+        
+        xn = awgn(tx_upconverted,trainSNR,'measured');
+
+        rx_downconverted = xn .* exp(-1j * 2 * pi * carrier_freq * t);
+        rx_fft = fft(rx_downconverted(cp_len+1:end), N);
+
+        xn = (rx_fft);
+    
+
+    if whoRU == 1 % YES
+        
+    ansVec = [1 0];
+
+
+      corrVec = (xcorr(xx,xn));
+
+      [Un, Sn, Vn] = makeHankel(ifft(corrVec).');
+      trainData2 = [trainData2 (diag(Sn))];
+      trainData3 = [trainData3 abs(corrVec)];
+      trainData4 = [trainData4 abs(ifft(corrVec))];
+        
+      a = abs(ifft(corrVec));
+      featureVec = [a(1:N)', sum(a(1:N).^2)];
+      trainData_RF = [trainData_RF; featureVec]; 
+      
+      
+      trainAns = [trainAns transpose(ansVec)];
+    else  % NO
+    
+    ansVec = [0 1];
+
+      corrVec = (xcorr(xx,xn-xx));
+
+      [Un, Sn, Vn] = makeHankel(ifft(corrVec).');
+      trainData2 = [trainData2 (diag(Sn))];
+      trainData3 = [trainData3 abs(corrVec)];
+      trainData4 = [trainData4 abs(ifft(corrVec))];
+
+      a = abs(ifft(corrVec));
+      featureVec = [a(1:N)', sum(a(1:N).^2)];
+      trainData_RF = [trainData_RF; featureVec]; 
+
+      trainAns = [trainAns transpose(ansVec)];
+    end
+end
+
+
+trainLabels = categorical(vec2ind(trainAns)); 
+numTrees = 2; 
+RFModel = TreeBagger(numTrees, trainData_RF, trainLabels, 'Method', 'classification');
+
+ layers2 = [
+        featureInputLayer(size(trainData2,1))       
+        fullyConnectedLayer(hiddenSize)            
+        %reluLayer
+        leakyReluLayer
+        fullyConnectedLayer(hiddenSize)            
+        %reluLayer
+        leakyReluLayer
+        fullyConnectedLayer(2)];
+
+ layers3 = [
+        featureInputLayer(size(trainData3,1))       
+        fullyConnectedLayer(hiddenSize)            
+        %reluLayer
+        leakyReluLayer
+        fullyConnectedLayer(hiddenSize)            
+        %reluLayer
+        leakyReluLayer
+        fullyConnectedLayer(2)];
+
+
+    % options = trainingOptions('adam', ...
+    %     'MaxEpochs', MaxEpochs, ...
+    %     'InitialLearnRate', InitialLearnRate, ...
+    %     'MiniBatchSize', MiniBatchSize);
+    options = trainingOptions('sgdm', ...
+     'InitialLearnRate', 1e-3, ...
+    'MaxEpochs', 30, ...
+    'MiniBatchSize', TrainSet, ...
+   'Shuffle', 'never', ...
+   'Momentum',0.8,...
+   'Verbose',false);
+
+     net2 = trainnet(trainData2.', trainAns.', layers2,"mse", options);
+     net3= trainnet(trainData3.', trainAns.', layers3,"mse",options);
+     net4= trainnet(trainData4.', trainAns.', layers3,"mse", options);
+
+     
+
+parfor k=1:TestSet
+    
+    R= 0;
+    R = Rset(randi(length(Rset),1));
+
+    testSNR = trainSNR;
+
+    whoRU = randi(2,1);
+    
+
+        xx_freq = zadoffChuSeq(R, N);
+        xx = ifft(xx_freq); 
+        
+        % CP 추가
+        xx_cp = [xx(end-cp_len+1:end); xx];
+
+        % 다중경로 채널 모델 적용 (TDL-B)
+        h_time = zeros(N, 1);
+        for l = 1:L
+            delay_samples = round(tap_delays(l) * Fs);
+            if delay_samples < N
+                h_time(delay_samples+1) = (randn + 1j*randn) * sqrt(tap_powers(l)/2);
+            end
+        end
+
+        h_freq = fft(h_time, N);
+        rx_signal_freq = xx_freq .* h_freq;
+        rx_signal_time = ifft(rx_signal_freq);
+
+      
+        t = (0:length(rx_signal_time)-1).' / Fs;
+        tx_upconverted = rx_signal_time .* exp(1j * 2 * pi * carrier_freq * t);
+        
+        xn = awgn(tx_upconverted,testSNR,'measured');
+
+        
+        rx_downconverted = xn .* exp(-1j * 2 * pi * carrier_freq * t);
+        rx_fft = fft(rx_downconverted(cp_len+1:end), N);
+
+       
+        xn = (rx_fft);
+
+    if whoRU == 1 % YES
+        
+    ansVec = [1 0];
+
+
+      corrVec = (xcorr(xx,xn));
+
+      [Un, Sn, Vn] = makeHankel(ifft(corrVec).');
+      testData2 = [testData2 (diag(Sn))];
+      testData3 = [testData3 abs(corrVec)];
+      testData4 = [testData4 abs(ifft(corrVec))];
+
+      a = abs(ifft(corrVec));
+      featureVec = [a(1:N)', sum(a(1:N).^2)];
+      testData_RF = [testData_RF; featureVec];
+
+
+
+      testAns = [testAns transpose(ansVec)];
+    else  % NO
+    
+    ansVec = [0 1];
+
+      corrVec = (xcorr(xx,xn-xx));
+
+      [Un, Sn, Vn] = makeHankel(ifft(corrVec).');
+      testData2 = [testData2 (diag(Sn))];
+      testData3 = [testData3 abs(corrVec)];
+      testData4 = [testData4 abs(ifft(corrVec))];
+
+      a = abs(ifft(corrVec));
+      featureVec = [a(1:N)', sum(a(1:N).^2)];
+      testData_RF = [testData_RF; featureVec];
+      
+      testAns = [testAns transpose(ansVec)];
+    end
+
+    sortedCorr = sort(ifft(corrVec),'ascend');
+    noiseLevel = mean(sortedCorr(1:round(0.3 * length(sortedCorr)))); 
+    threshold = 3 * noiseLevel; 
+    
+    detected = max(ifft(corrVec)) > threshold; 
+    testData_AT = [testData_AT detected]; 
+
+end
+
+
+%testResult2 = net2(testData2);
+testResult2 = predict(net2, testData2.');
+testResult2_mat = zeros(2,TestSet);
+
+[ss ii] = max(testResult2.');
+for k=1:TestSet
+testResult2_mat(ii(k),k)=1;
+end
+
+%testResult3 = net3(testData3);
+testResult3 = predict(net3, testData3.');
+testResult3_mat = zeros(2,TestSet);
+
+[ss ii] = max(testResult3.');
+for k=1:TestSet
+testResult3_mat(ii(k),k)=1;
+end
+
+testResult4 = predict(net4, testData4.');
+testResult4_mat = zeros(2,TestSet);
+
+[ss ii] = max(testResult4.');
+for k=1:TestSet
+testResult4_mat(ii(k),k)=1;
+end
+
+testResult_RF = str2double(predict(RFModel, testData_RF)); 
+
+testResult_RF_f = zeros(2,TestSet);
+
+for j = 1: TestSet
+
+    if testResult_RF(j,:) == 1
+
+        testResult_RF_f(1,j) = 1;
+    else
+        testResult_RF_f(2,j) =1;
+    end
+end
+
+testResult_AT = zeros(2,TestSet);
+
+for j = 1:TestSet
+    
+    if testData_AT(:,j) == 0
+
+        testResult_AT(1,j)=1;
+    else
+        testResult_AT(2,j)=1;
+    end
+
+end
+
+
+detectionRate2(indexN) = sum(sum(testResult2_mat.*testAns)) / TestSet;
+detectionRate3(indexN) = sum(sum(testResult3_mat.*testAns)) / TestSet;
+detectionRate4(indexN) = sum(sum(testResult4_mat.*testAns)) / TestSet;
+detectionRate5(indexN) = sum(sum(testResult_RF_f.*testAns)) / TestSet;
+detectionRate6(indexN) = sum(sum(testResult_AT.*testAns)) / TestSet;
+end
+
+%%
+figure(1)
+semilogy(trainSNRVec, 1-detectionRate2,'r*-'); hold on
+semilogy(trainSNRVec, 1-detectionRate3, 'b-square'); hold on
+semilogy(trainSNRVec, 1-detectionRate4, 'g-+'); hold on
+semilogy(trainSNRVec, 1 - detectionRate5, 'm-o'); hold on
+semilogy(trainSNRVec, 1 - detectionRate6, 'k-^'); hold on
+xlabel('SNR [dB]')
+ylabel('Detection error rate')
+legend('Proposed method','Deep learning method based on cross-correlation','Deep learning based on IFFT-processed cross-correlation', ...
+    'Random forest method','Adaptive threshold method',...
+    'location','best')
+xticks(trainSNRVec)
+%xlim([min(trainSNRVec) max(trainSNRVec)])
+grid on
+hold off
